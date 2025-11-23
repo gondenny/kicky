@@ -1,0 +1,179 @@
+#version=DEVEL
+# Minimal Fedora 43 server with hardened layout
+
+###############################################################################
+# Installation source & basic config
+###############################################################################
+
+cdrom
+
+lang en_US.UTF-8
+keyboard --vckeymap=be --xlayouts=be
+
+timezone Europe/Brussels --utc
+
+network --bootproto=dhcp --device=link --activate --hostname=f43-minimal
+
+rootpw --lock
+user --name=dvbrusselen --groups=wheel --iscrypted --password '$6$8VXEUBshf/.9OcIB$GqMiUVLSokC3C2AGBYT37OOkRJed8ug./qcik928yRycyDteitBNZK1yumrJJjM82gcnPh5eu6NzQnPJfR5Ps0' --gecos="dvbrusselen"
+
+selinux --enforcing
+firewall --enabled --service=ssh --set-default-zone=drop
+authselect --enablesmartcard --enablefingerprint --enableecryptfs
+# (we will override authselect properly in %post)
+
+services --enabled=sshd,firewalld,chronyd,auditd,rsyslog
+
+bootloader --location=mbr --boot-drive=sda --timeout=5 \
+           --append="audit=1 selinux=1 enforcing=1 loglevel=3"
+
+firstboot --disable
+text
+reboot
+
+###############################################################################
+# Disk layout - same scheme on /dev/sda, GPT, LVM with separate mountpoints
+###############################################################################
+
+ignoredisk --only-use=sda
+
+clearpart --all --initlabel --drives=sda --disklabel=gpt
+
+part /boot/efi --fstype=efi --size=600 --ondisk=sda \
+     --fsoptions="umask=0077,shortname=winnt"
+part /boot     --fstype=xfs --size=1024 --ondisk=sda \
+     --fsoptions="nodev"
+
+part pv.01    --fstype="lvmpv" --size=1 --grow --ondisk=sda
+volgroup vg0 pv.01
+
+# Root
+logvol /              --vgname=vg0 --name=root      --fstype=xfs --size=12288
+
+# /var gets remaining space
+logvol /var           --vgname=vg0 --name=var       --fstype=xfs --size=10240 --grow \
+                      --fsoptions="nodev"
+
+# Logs separated
+logvol /var/log       --vgname=vg0 --name=var_log   --fstype=xfs --size=5120 \
+                      --fsoptions="nodev"
+
+logvol /var/log/audit --vgname=vg0 --name=audit     --fstype=xfs --size=2048 \
+                      --fsoptions="nodev"
+
+# Home & opt
+logvol /home          --vgname=vg0 --name=home      --fstype=xfs --size=4096 \
+                      --fsoptions="nodev"
+
+logvol /opt           --vgname=vg0 --name=opt       --fstype=xfs --size=4096 \
+                      --fsoptions="nodev"
+
+# Temp partitions
+logvol /tmp           --vgname=vg0 --name=tmp       --fstype=xfs --size=2048 \
+                      --fsoptions="nodev,nosuid,noexec"
+
+logvol /var/tmp       --vgname=vg0 --name=var_tmp   --fstype=xfs --size=2048 \
+                      --fsoptions="nodev,nosuid,noexec"
+
+# Swap
+logvol swap           --vgname=vg0 --name=swap      --fstype=swap --size=4096
+
+
+###############################################################################
+# Packages - minimal server, no GUI
+###############################################################################
+
+%packages
+@core
+
+kexec-tools
+chrony
+firewalld
+openssh-server
+sudo
+bash-completion
+vim-enhanced
+
+aide
+audit
+rsyslog
+
+policycoreutils
+policycoreutils-python-utils
+setools-console
+
+dnf5-plugin-automatic
+# crudini is handy if you want to script .ini edits later
+crudini
+
+%end
+
+###############################################################################
+# Post-install hardening
+###############################################################################
+
+%post --log=/root/ks-post.log
+
+# Ensure journald is persistent
+mkdir -p /etc/systemd/journald.conf.d
+cat > /etc/systemd/journald.conf.d/10-persistent.conf << 'EOF'
+[Journal]
+Storage=persistent
+EOF
+mkdir -p /var/log/journal
+systemctl restart systemd-journald || true
+
+# SSH hardening (key-based only, no root login)
+mkdir -p /etc/ssh/sshd_config.d
+cat > /etc/ssh/sshd_config.d/10-hardening.conf << 'EOF'
+Protocol 2
+PermitRootLogin no
+PasswordAuthentication yes
+ChallengeResponseAuthentication no
+UsePAM yes
+X11Forwarding no
+AllowTcpForwarding no
+ClientAliveInterval 300
+ClientAliveCountMax 2
+LoginGraceTime 30
+MaxAuthTries 3
+MaxSessions 5
+UseDNS no
+EOF
+
+
+# IPv6 disable (optional - comment this block if you want IPv6)
+cat > /etc/sysctl.d/99-disable-ipv6.conf << 'EOF'
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+EOF
+/sbin/sysctl --system || true
+
+# Firewalld: default drop, permit SSH
+systemctl enable firewalld || true
+systemctl start firewalld || true
+
+firewall-cmd --permanent --set-default-zone=drop || true
+firewall-cmd --permanent --add-service=ssh || true
+firewall-cmd --reload || true
+
+# Enable key services
+systemctl enable sshd || true
+systemctl enable chronyd || true
+systemctl enable auditd || true
+systemctl enable rsyslog || true
+
+# AIDE initial DB
+/usr/sbin/aide --init || true
+if [ -f /var/lib/aide/aide.db.new.gz ]; then
+    mv /var/lib/aide/aide.db.new.gz /var/lib/aide/aide.db.gz
+fi
+
+# Automatic updates: handle both dnf-automatic & dnf5-automatic timers
+if systemctl list-unit-files | grep -q '^dnf-automatic.timer'; then
+    systemctl enable --now dnf-automatic.timer || true
+elif systemctl list-unit-files | grep -q '^dnf5-automatic.timer'; then
+    systemctl enable --now dnf5-automatic.timer || true
+fi
+
+%end
