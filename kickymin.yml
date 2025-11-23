@@ -153,7 +153,6 @@ EOF
 systemctl enable firewalld || true
 systemctl start firewalld || true
 
-firewall-cmd --permanent --set-default-zone=drop || true
 firewall-cmd --permanent --add-service=ssh || true
 firewall-cmd --reload || true
 
